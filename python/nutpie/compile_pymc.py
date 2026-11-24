@@ -1,3 +1,4 @@
+import contextlib
 import dataclasses
 import itertools
 import threading
@@ -35,6 +36,33 @@ _UNCONSTRAINED_PARAMETER = "unconstrained_parameter"
 
 # Bump when native callback or shared-data extraction semantics change.
 _NUMBA_CFUNC_CACHE_VERSION = 1
+
+# Held for every call into a compiled MLX graph and for each input signature's
+# first evaluation. Tracing can enter mx.stream, which sets the default device
+# for the whole process, and concurrent first evaluations crash while Metal
+# kernels are built.
+_MLX_LOCK = threading.Lock()
+
+
+class _FirstEvaluationGuard:
+    """Hold the MLX lock while each input signature is evaluated the first time."""
+
+    def __init__(self):
+        self._evaluated = set()
+
+    @contextlib.contextmanager
+    def __call__(self, signature):
+        if signature in self._evaluated:
+            yield
+            return
+
+        with _MLX_LOCK:
+            yield
+            self._evaluated.add(signature)
+
+
+def _mlx_signature(arrays) -> tuple:
+    return tuple((tuple(array.shape), array.dtype) for array in arrays)
 
 
 def _rv_dict_to_flat_array_wrapper(
@@ -610,12 +638,17 @@ def _compile_pymc_model_mlx(
         shared_data[val.name] = to_mlx(val.get_value())
         seen.add(val)
 
+    logp_guard = _FirstEvaluationGuard()
+    expand_guard = _FirstEvaluationGuard()
+
     def make_logp_func():
         def logp(_x, **shared):
             shared_values = [shared[name] for name in logp_shared_names]
-            logp, grad = logp_fn(_x, *shared_values)
-            mx.eval(logp, grad)
-            return logp.item(), np.asarray(grad, dtype="float64", order="C")
+            with _MLX_LOCK:
+                logp, grad = logp_fn(_x, *shared_values)
+            with logp_guard(_mlx_signature(shared_values)):
+                mx.eval(logp, grad)
+                return logp.item(), np.asarray(grad, dtype="float64", order="C")
 
         return logp
 
@@ -625,14 +658,16 @@ def _compile_pymc_model_mlx(
     def make_expand_func(seed1, seed2, chain):
         def expand(_x, **shared):
             shared_values = [shared[name] for name in expand_shared_names]
-            values = expand_fn(_x, *shared_values)
-            mx.eval(*values)
-            return {
-                name: np.asarray(val, order="C", dtype=dtype).reshape(shape)
-                for name, val, dtype, shape in zip(
-                    names, values, dtypes, shapes, strict=True
-                )
-            }
+            with _MLX_LOCK:
+                values = expand_fn(_x, *shared_values)
+            with expand_guard(_mlx_signature(shared_values)):
+                mx.eval(*values)
+                return {
+                    name: np.asarray(val, order="C", dtype=dtype).reshape(shape)
+                    for name, val, dtype, shape in zip(
+                        names, values, dtypes, shapes, strict=True
+                    )
+                }
 
         return expand
 

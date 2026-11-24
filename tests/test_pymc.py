@@ -1,5 +1,10 @@
+import subprocess
+import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from importlib.util import find_spec
+from pathlib import Path
 
 import pytest
 
@@ -579,6 +584,53 @@ def test_sampling_mlx():
     np.testing.assert_allclose(a.std(), expected_std, atol=0.05)
 
 
+def check_mlx_concurrent_first_calls(rng, n_threads):
+    with pm.Model() as model:
+        mu = pm.Normal("mu", 0, 10, shape=10)
+        sigma = pm.HalfNormal("sigma")
+        pm.Normal("obs", mu, sigma, observed=rng.normal(size=(200, 10)))
+
+    compiled = nutpie.compile_pymc_model(model, backend="mlx")
+    x = np.zeros(compiled.n_dim)
+    barrier = threading.Barrier(n_threads, timeout=60)
+
+    def first_call():
+        logp_fn = compiled._make_logp_func()
+        barrier.wait()
+        return logp_fn(x, **compiled._shared_data)[0]
+
+    with ThreadPoolExecutor(max_workers=n_threads) as executor:
+        futures = [executor.submit(first_call) for _ in range(n_threads)]
+    logps = [future.result() for future in futures]
+
+    assert logps == [logps[0]] * n_threads, logps
+
+
+def mlx_concurrent_first_calls_worker():
+    # A tiny switch interval makes the threads interleave while the first call
+    # traces the compiled function.
+    sys.setswitchinterval(1e-6)
+    rng = np.random.default_rng(0)
+
+    for _ in range(3):
+        check_mlx_concurrent_first_calls(rng=rng, n_threads=8)
+
+
+@pytest.mark.pymc
+@pytest.mark.skipif(not MLX_AVAILABLE, reason="MLX not installed")
+def test_mlx_concurrent_first_calls():
+    # A race here can segfault, so each attempt runs in its own process.
+    for _ in range(3):
+        result = subprocess.run(
+            [sys.executable, str(Path(__file__).resolve())],
+            capture_output=True,
+            text=True,
+            timeout=600,
+            check=False,
+        )
+        assert result.returncode == 0, result.stderr[-3000:]
+
+
 @pytest.mark.pymc
 @pytest.mark.skipif(not MLX_AVAILABLE, reason="MLX not installed")
 def test_mlx_keeps_float64_on_cpu():
@@ -678,7 +730,6 @@ def test_zarr_store(tmp_path):
 @pytest.fixture
 def tmp_path():
     import tempfile
-    from pathlib import Path
 
     with tempfile.TemporaryDirectory() as tmpdirname:
         yield Path(tmpdirname)
@@ -811,3 +862,7 @@ def test_init_point_fn_unknown_key(backend, gradient_backend):
 
     with pytest.raises(KeyError, match="sigma_log__"):
         init(1, 0)
+
+
+if __name__ == "__main__":
+    mlx_concurrent_first_calls_worker()
