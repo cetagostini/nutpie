@@ -39,6 +39,7 @@ class PyFuncModel(CompiledModel):
     _init_point_layout: tuple[list[str], list[tuple[int, ...]]] | None = None
     # User init function `fn(model, rng, chain_id)`, see `with_init_point_fn`
     _init_point_fn: Callable | None = None
+    _shared_data_converter: Callable[[Any], Any] | None = None
 
     @property
     def shapes(self) -> dict[str, tuple[int, ...]]:
@@ -61,8 +62,14 @@ class PyFuncModel(CompiledModel):
             if name not in self._shared_data:
                 raise ValueError(f"Unknown data variable: {name}")
 
+        if self._shared_data_converter is not None:
+            updates = {
+                name: self._shared_data_converter(value)
+                for name, value in updates.items()
+            }
+
         updated = self._shared_data.copy()
-        updated.update(**updates)
+        updated.update(updates)
         return dataclasses.replace(self, _shared_data=updated)
 
     def with_transform_adapt(self, **kwargs):
@@ -170,6 +177,7 @@ def from_pyfunc(
     make_transform_adapter=None,
     raw_logp_fn=None,
     reparameterized_names=None,
+    shared_data_converter: Callable[[Any], Any] | None = None,
 ):
     if coords is None:
         coords = {}
@@ -207,4 +215,5 @@ def from_pyfunc(
         _raw_logp_fn=raw_logp_fn,
         _init_point_layout=init_point_layout,
         reparameterized_names=reparameterized_names,
+        _shared_data_converter=shared_data_converter,
     )
