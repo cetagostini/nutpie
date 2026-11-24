@@ -552,6 +552,18 @@ def test_deterministic_sampling_jax():
 
 
 @pytest.mark.pymc
+def test_flow_adaptation_requires_raw_logp_fn():
+    with pm.Model() as model:
+        pm.Normal("a")
+    compiled = nutpie.compile_pymc_model(
+        model, backend="jax", gradient_backend="pytensor"
+    )
+
+    with pytest.raises(ValueError, match="adaptation='flow'"):
+        nutpie.sample(compiled, adaptation="flow")
+
+
+@pytest.mark.pymc
 def test_zarr_store(tmp_path):
     coords = {
         "a": np.arange(2).astype("f"),
