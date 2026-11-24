@@ -16,9 +16,15 @@ import pytest
 import nutpie
 import nutpie.compile_pymc
 
+MLX_AVAILABLE = find_spec("mlx") is not None
+
+backend_params = [("numba", None), ("jax", "pytensor"), ("jax", "jax")]
+if MLX_AVAILABLE:
+    backend_params.append(("mlx", "pytensor"))
+
 parameterize_backends = pytest.mark.parametrize(
     "backend, gradient_backend",
-    [("numba", None), ("jax", "pytensor"), ("jax", "jax")],
+    backend_params,
 )
 
 
@@ -551,6 +557,49 @@ def test_deterministic_sampling_jax():
     return trace.posterior.a.values.ravel()
 
 
+# GPU float32 rounding differs between machines, so reference draws would not
+# reproduce. Check analytic moments.
+@pytest.mark.pymc
+@pytest.mark.skipif(not MLX_AVAILABLE, reason="MLX not installed")
+def test_sampling_mlx():
+    with pm.Model() as model:
+        pm.HalfNormal("a")
+
+    compiled = nutpie.compile_pymc_model(model, backend="mlx")
+    trace = nutpie.sample(
+        compiled, chains=4, seed=123, draws=4000, tune=1000, progress_bar=False
+    )
+    a = trace.posterior.a.values
+
+    assert (a >= 0).all()
+
+    expected_mean = np.sqrt(2.0 / np.pi)
+    expected_std = np.sqrt(1.0 - 2.0 / np.pi)
+    np.testing.assert_allclose(a.mean(), expected_mean, atol=0.05)
+    np.testing.assert_allclose(a.std(), expected_std, atol=0.05)
+
+
+@pytest.mark.pymc
+@pytest.mark.skipif(not MLX_AVAILABLE, reason="MLX not installed")
+def test_mlx_keeps_float64_on_cpu():
+    import mlx.core as mx
+
+    with pm.Model() as model:
+        pm.Normal("a")
+
+    default_device = mx.default_device()
+    mx.set_default_device(mx.cpu)
+    try:
+        compiled = nutpie.compile_pymc_model(model, backend="mlx")
+        point = np.array([1 + 1e-9])
+        _, grad = compiled._make_logp_func()(point, **compiled._shared_data)
+    finally:
+        mx.set_default_device(default_device)
+
+    # float32 would round the point, and so the gradient, to exactly -1.
+    assert grad[0] == -(1 + 1e-9)
+
+
 @pytest.mark.pymc
 def test_flow_adaptation_requires_raw_logp_fn():
     with pm.Model() as model:
@@ -561,6 +610,16 @@ def test_flow_adaptation_requires_raw_logp_fn():
 
     with pytest.raises(ValueError, match="adaptation='flow'"):
         nutpie.sample(compiled, adaptation="flow")
+
+
+@pytest.mark.pymc
+@pytest.mark.parametrize("backend", ["numba", "mlx"])
+def test_jax_gradient_requires_jax_backend(backend):
+    with pm.Model() as model:
+        pm.Normal("a")
+
+    with pytest.raises(ValueError, match="Gradient backend cannot be jax"):
+        nutpie.compile_pymc_model(model, backend=backend, gradient_backend="jax")
 
 
 @pytest.mark.pymc
