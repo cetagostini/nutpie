@@ -1,3 +1,4 @@
+import os
 import subprocess
 import sys
 import threading
@@ -662,6 +663,17 @@ def test_flow_adaptation_requires_raw_logp_fn():
 
     with pytest.raises(ValueError, match="adaptation='flow'"):
         nutpie.sample(compiled, adaptation="flow")
+
+
+@pytest.mark.pymc
+@pytest.mark.skipif(
+    not os.environ.get("NUTPIE_REQUIRE_MLX"),
+    reason="only checked where MLX must run on the GPU",
+)
+def test_mlx_default_device_is_gpu():
+    import mlx.core as mx
+
+    assert mx.default_device() == mx.gpu
 
 
 @pytest.mark.pymc
